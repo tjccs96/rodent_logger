@@ -1,0 +1,15 @@
+[package]
+name = "rodent_logger_gui"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[[bin]]
+name = "gui"
+path = "src/main.rs"
+
+[dependencies]
+rodent_logger_core = { path = "../rodent_logger_core" }
+iced = { version = "0.14.0", features = ["tokio"] }
+chrono = "0.4.45"
+pcap = "2.4.0"
