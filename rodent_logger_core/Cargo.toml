@@ -1,0 +1,10 @@
+[package]
+name = "rodent_logger_core"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+pcap = "2.4.0"
+etherparse = "0.20.2"
+csv = "1.4.0"

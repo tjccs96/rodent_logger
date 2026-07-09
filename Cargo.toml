@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "rodent_logger_core",
+    "rodent_logger_cli",
+    "rodent_logger_gui",
+]
+resolver = "2"
+default-members = ["rodent_logger_cli"]
+
+[workspace.package]
+license = "MIT"
