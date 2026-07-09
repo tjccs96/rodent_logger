@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use etherparse::{Ethernet2Header, Ipv4Header, TcpHeader};
 use pcap::{Capture, Device};
-use rodent_logger_core::{TcpState, capture, export_csv, generate_stats, read_bdo_string, rodent_logger_dir};
+use rodent_logger_core::{TcpState, capture, detect_format, export_csv, find_all_bdo_strings, find_guild_marker, generate_stats, load_packet_formats, packet_format_path, read_bdo_string, rodent_logger_dir, save_packet_format};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -43,6 +43,20 @@ enum Commands {
         input: String,
         #[arg(short, long)]
         name: String,
+    },
+    Detect {
+        #[arg(short, long)]
+        input: String,
+        #[arg(short, long)]
+        name: Option<String>,
+    },
+    DumpStrings {
+        #[arg(short, long)]
+        input: String,
+        #[arg(short, long)]
+        opcode: Option<u16>,
+        #[arg(short, long)]
+        packet_len: Option<usize>,
     },
 }
 
@@ -337,5 +351,126 @@ fn main() {
             println!("{}", generate_stats(&input));
         }
         Commands::FindOpcode { input, name } => find_opcode(&input, &name),
+        Commands::Detect { input, name } => {
+            match detect_format(&input, name.as_deref()) {
+                Ok(fmt) => {
+                    println!("Detected packet format:");
+                    println!("  Opcode: 0x{:04X}", fmt.opcode);
+                    println!("  Packet length: {} bytes", fmt.packet_len);
+                    println!("  Enemy char offset: {}", fmt.enemy_char_offset);
+                    println!("  Enemy family offset: {}", fmt.enemy_family_offset);
+                    println!("  Friendly char offset: {}", fmt.friendly_char_offset);
+                    println!("  Friendly family offset: {}", fmt.friendly_family_offset);
+                    println!("  Guild marker offset: {}", fmt.guild_marker_offset);
+                    println!("  Guild flag offset rel: {:+}", fmt.guild_flag_offset_from_marker);
+                    println!("  Guild string offset rel: {:+}", fmt.guild_string_offset_from_marker);
+
+                    match save_packet_format(&fmt) {
+                        Ok(()) => println!("\nSaved to {}", packet_format_path().display()),
+                        Err(e) => eprintln!("\nFailed to save: {}", e),
+                    }
+                }
+                Err(e) => eprintln!("Detection failed: {}", e),
+            }
+        }
+        Commands::DumpStrings { input, opcode, packet_len } => {
+            let fmt = load_packet_formats();
+            let target = opcode.zip(packet_len)
+                .or_else(|| fmt.first().map(|f| (f.opcode, f.packet_len)));
+
+            let (target_opcode, target_len) = match target {
+                Some((op, len)) => (op, len),
+                None => {
+                    eprintln!("No saved format and no --opcode/--packet-len provided");
+                    return;
+                }
+            };
+
+            let mut cap = match pcap::Capture::from_file(&input) {
+                Ok(c) => c,
+                Err(e) => { eprintln!("Failed to open pcap: {}", e); return; }
+            };
+            let mut streams: HashMap<(IpAddr, u16, IpAddr, u16), TcpState> = HashMap::new();
+
+            while let Ok(packet) = cap.next_packet() {
+                if let Ok(headers) = etherparse::PacketHeaders::from_ethernet_slice(packet.data) {
+                    if let Some(transport) = headers.transport {
+                        if let etherparse::TransportHeader::Tcp(tcp) = transport {
+                            let payload = headers.payload.slice();
+                            if payload.is_empty() { continue; }
+
+                            let src_ip = match headers.net.as_ref().unwrap() {
+                                etherparse::NetHeaders::Ipv4(ipv4, _) => IpAddr::V4(Ipv4Addr::from(ipv4.source)),
+                                etherparse::NetHeaders::Ipv6(ipv6, _) => IpAddr::V6(std::net::Ipv6Addr::from(ipv6.source)),
+                                etherparse::NetHeaders::Arp(_) => continue,
+                            };
+                            let dst_ip = match headers.net.as_ref().unwrap() {
+                                etherparse::NetHeaders::Ipv4(ipv4, _) => IpAddr::V4(Ipv4Addr::from(ipv4.destination)),
+                                etherparse::NetHeaders::Ipv6(ipv6, _) => IpAddr::V6(std::net::Ipv6Addr::from(ipv6.destination)),
+                                etherparse::NetHeaders::Arp(_) => continue,
+                            };
+                            let key = (src_ip, tcp.source_port, dst_ip, tcp.destination_port);
+                            let state = streams.entry(key).or_insert(TcpState { buffer: Vec::new(), next_seq: tcp.sequence_number });
+
+                            let seq = tcp.sequence_number;
+                            let payload_len = payload.len() as u32;
+                            if seq == state.next_seq {
+                                state.buffer.extend_from_slice(payload);
+                                state.next_seq = seq.wrapping_add(payload_len);
+                            } else {
+                                state.buffer.clear();
+                                state.buffer.extend_from_slice(payload);
+                                state.next_seq = seq.wrapping_add(payload_len);
+                            }
+
+                            let mut offset = 0;
+                            while offset + 5 <= state.buffer.len() {
+                                let p_len = u16::from_le_bytes([state.buffer[offset], state.buffer[offset + 1]]) as usize;
+                                if p_len < 5 || p_len > 1000 { offset += 1; continue; }
+                                if offset + p_len > state.buffer.len() { break; }
+
+                                let bdo_packet = &state.buffer[offset..offset + p_len];
+                                let is_unencrypted = bdo_packet[2] == 0x00;
+                                let opcode_val = u16::from_le_bytes([bdo_packet[3], bdo_packet[4]]);
+
+                                if is_unencrypted && opcode_val == target_opcode && p_len == target_len {
+                                    let strings = find_all_bdo_strings(bdo_packet);
+                                    let guild = find_guild_marker(bdo_packet);
+
+                                    println!("Found matching packet ({} bytes):\n", p_len);
+                                    println!("--- All BDO strings by offset ---");
+                                    for (s, off) in &strings {
+                                        println!("  {:>4}: \"{}\"", off, s);
+                                    }
+
+                                    if let Some((gm_off, flag_rel, guild_rel)) = guild {
+                                        let guild_off = gm_off + guild_rel as usize;
+                                        println!("\n--- Guild marker ---");
+                                        println!("  Marker at offset: {}", gm_off);
+                                        println!("  Flag rel: {:+} -> byte {}", flag_rel, if flag_rel >= 0 { gm_off + flag_rel as usize } else { gm_off.saturating_sub((-flag_rel) as usize) });
+                                        println!("  Guild string rel: {:+} -> byte {} -> \"{}\"", guild_rel, guild_off, read_bdo_string(bdo_packet, guild_off));
+                                        println!("\n--- Raw bytes around marker (offset {}) ---", gm_off);
+                                        let start = gm_off.saturating_sub(8);
+                                        let end = (gm_off + 20).min(bdo_packet.len());
+                                        for i in start..end {
+                                            print!("{:02x} ", bdo_packet[i]);
+                                            if (i - start + 1) % 16 == 0 { println!(); }
+                                        }
+                                        println!();
+                                    } else {
+                                        println!("\nNo guild marker found");
+                                    }
+
+                                    println!();
+                                    // Only dump the first 5 matching packets, then stats
+                                }
+                                offset += p_len;
+                            }
+                        }
+                    }
+                }
+            }
+            eprintln!("No matching packet found");
+        }
     }
 }

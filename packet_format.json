@@ -1,0 +1,14 @@
+[
+  {
+    "opcode": 6834,
+    "packet_len": 358,
+    "enemy_char_offset": 8,
+    "enemy_family_offset": 267,
+    "friendly_char_offset": 70,
+    "friendly_family_offset": 205,
+    "guild_marker_offset": 196,
+    "guild_flag_offset_from_marker": 4,
+    "guild_string_offset_from_marker": 9,
+    "guild_string_offset": 133
+  }
+]
