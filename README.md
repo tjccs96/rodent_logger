@@ -173,7 +173,7 @@ rodent_logger analyze -i my_nodewar.pcap
 The game format may have changed, or the pcap does not contain enough data. Run `detect` manually with your character name:
 
 ```bash
-rodent_logger detect -i my_nodewar.pcap -n MyCharacterName
+rodent_logger detect -i my_nodewar.pcap -n MyFamilyName
 ```
 
 Then re-run `export-csv`.
@@ -184,7 +184,7 @@ Delete `packet_format.json` and re-run `detect` with your character name to reor
 
 ```bash
 rm packet_format.json
-rodent_logger detect -i my_nodewar.pcap -n MyCharacterName
+rodent_logger detect -i my_nodewar.pcap -n MyFamilyName
 ```
 
 ### No events after a patch
