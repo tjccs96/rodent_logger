@@ -191,6 +191,17 @@ rodent_logger detect -i my_nodewar.pcap -n MyFamilyName
 
 Use `find-opcode` with a known player name to discover the new opcode, then update or regenerate `packet_format.json` with `detect`.
 
+## License
+
+This project is licensed under either of:
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this project by you shall be dual licensed as above, without any additional terms or conditions.
+
 ## Disclaimer
 
 This tool passively analyzes raw network packets and does not hook into, inject, or modify the Black Desert Online game client in any way. However, the use of packet sniffers may violate the Terms of Service of the game. **Use this tool at your own risk.**
