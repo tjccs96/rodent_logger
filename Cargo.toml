@@ -8,4 +8,4 @@ resolver = "2"
 default-members = ["rodent_logger_cli"]
 
 [workspace.package]
-license = "MIT"
+license = "MIT OR Apache-2.0"
