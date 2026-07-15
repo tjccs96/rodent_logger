@@ -1,7 +1,12 @@
 use clap::{Parser, Subcommand};
 use etherparse::{Ethernet2Header, Ipv4Header, TcpHeader};
 use pcap::{Capture, Device};
-use rodent_logger_core::{TcpState, capture, detect_format, export_csv, find_all_bdo_strings, find_guild_marker, generate_stats, load_packet_formats, packet_format_path, read_bdo_string, rodent_logger_dir, save_packet_format};
+use rodent_logger_core::{
+    TcpState, calibrate_format, capture, detect_format, export_csv, find_all_bdo_strings,
+    find_calibration_candidates, find_guild_marker, generate_stats, load_known_formats,
+    load_packet_formats, packet_format_path, read_bdo_string, rodent_logger_dir,
+    save_packet_format,
+};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -57,6 +62,28 @@ enum Commands {
         opcode: Option<u16>,
         #[arg(short, long)]
         packet_len: Option<usize>,
+    },
+    /// Calibrate a packet format from a known event. Use --interactive to pick
+    /// strings interactively instead of passing all names as flags. Interactive
+    /// mode requires 5 strings in the packet, so it does not support the old
+    /// format (0x1AB2, 358 bytes) which omits the enemy character name.
+    Calibrate {
+        #[arg(short, long)]
+        input: String,
+        #[arg(long)]
+        friendly_char: Option<String>,
+        #[arg(long)]
+        friendly_family: Option<String>,
+        #[arg(long)]
+        enemy_char: Option<String>,
+        #[arg(long)]
+        enemy_family: Option<String>,
+        #[arg(long)]
+        enemy_guild: Option<String>,
+        #[arg(long)]
+        event: Option<String>,
+        #[arg(long, default_value_t = false)]
+        interactive: bool,
     },
 }
 
@@ -298,6 +325,47 @@ fn find_opcode(input: &str, target_name: &str) {
     );
 }
 
+fn prompt_usize(prompt: &str, max: usize) -> Option<usize> {
+    use std::io;
+    loop {
+        print!("{} (or 'q' to quit): ", prompt.trim_end());
+        let _ = io::Write::flush(&mut io::stdout());
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            continue;
+        }
+        let trimmed = input.trim();
+        if trimmed == "q" || trimmed == "Q" {
+            return None;
+        }
+        match trimmed.parse::<usize>() {
+            Ok(n) if n >= 1 && n <= max => return Some(n),
+            _ => println!("Please enter a number between 1 and {}", max),
+        }
+    }
+}
+
+fn prompt_event() -> Option<String> {
+    use std::io;
+    loop {
+        print!("Event type (kill/death, or 'q' to quit): ");
+        let _ = io::Write::flush(&mut io::stdout());
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            continue;
+        }
+        let trimmed = input.trim();
+        if trimmed == "q" || trimmed == "Q" {
+            return None;
+        }
+        let lowered = trimmed.to_lowercase();
+        if lowered == "kill" || lowered == "death" {
+            return Some(lowered);
+        }
+        println!("Please enter 'kill' or 'death'");
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -351,32 +419,199 @@ fn main() {
             println!("{}", generate_stats(&input));
         }
         Commands::FindOpcode { input, name } => find_opcode(&input, &name),
-        Commands::Detect { input, name } => {
-            match detect_format(&input, name.as_deref()) {
+        Commands::Detect { input, name } => match detect_format(&input, name.as_deref()) {
+            Ok(fmt) => {
+                println!("Detected packet format:");
+                println!("  Opcode: 0x{:04X}", fmt.opcode);
+                println!("  Packet length: {} bytes", fmt.packet_len);
+                println!("  Enemy char offset: {}", fmt.enemy_char_offset);
+                println!("  Enemy family offset: {}", fmt.enemy_family_offset);
+                println!("  Friendly char offset: {}", fmt.friendly_char_offset);
+                println!("  Friendly family offset: {}", fmt.friendly_family_offset);
+                println!("  Guild marker offset: {}", fmt.guild_marker_offset);
+                println!(
+                    "  Guild flag offset rel: {:+}",
+                    fmt.guild_flag_offset_from_marker
+                );
+                println!(
+                    "  Guild string offset rel: {:+}",
+                    fmt.guild_string_offset_from_marker
+                );
+
+                match save_packet_format(&fmt) {
+                    Ok(()) => println!("\nSaved to {}", packet_format_path().display()),
+                    Err(e) => eprintln!("\nFailed to save: {}", e),
+                }
+            }
+            Err(e) => eprintln!("Detection failed: {}", e),
+        },
+        Commands::Calibrate {
+            input,
+            friendly_char,
+            friendly_family,
+            enemy_char,
+            enemy_family,
+            enemy_guild,
+            event,
+            interactive,
+        } => {
+            let (friendly_char, friendly_family, enemy_char, enemy_family, enemy_guild, event) =
+                if interactive {
+                    let (opcode, packet_len, ts, strings) =
+                        match find_calibration_candidates(&input) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                eprintln!("Calibration failed: {}", e);
+                                return;
+                            }
+                        };
+
+                    println!(
+                        "Found packet format 0x{:04X} ({} bytes) at timestamp {}",
+                        opcode, packet_len, ts
+                    );
+                    println!("Strings found in a representative packet:");
+                    for (idx, (s, off)) in strings.iter().enumerate() {
+                        println!("  [{}] offset {:>3}: {}", idx + 1, off, s);
+                    }
+                    println!();
+
+                    let Some(friendly_char_idx) =
+                        prompt_usize("Friendly character (char name) index", strings.len())
+                    else {
+                        return;
+                    };
+                    let Some(friendly_family_idx) =
+                        prompt_usize("Friendly family index", strings.len())
+                    else {
+                        return;
+                    };
+                    let Some(enemy_char_idx) =
+                        prompt_usize("Enemy character (char name) index", strings.len())
+                    else {
+                        return;
+                    };
+                    let Some(enemy_family_idx) = prompt_usize("Enemy family index", strings.len())
+                    else {
+                        return;
+                    };
+                    let Some(enemy_guild_idx) = prompt_usize("Enemy guild index", strings.len())
+                    else {
+                        return;
+                    };
+
+                    let indices = [
+                        friendly_char_idx,
+                        friendly_family_idx,
+                        enemy_char_idx,
+                        enemy_family_idx,
+                        enemy_guild_idx,
+                    ];
+                    if indices
+                        .iter()
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                        != 5
+                    {
+                        eprintln!("Calibration failed: each selected string must be different");
+                        return;
+                    }
+
+                    let Some(event_str) = prompt_event() else {
+                        return;
+                    };
+
+                    (
+                        strings[friendly_char_idx - 1].0.clone(),
+                        strings[friendly_family_idx - 1].0.clone(),
+                        strings[enemy_char_idx - 1].0.clone(),
+                        strings[enemy_family_idx - 1].0.clone(),
+                        strings[enemy_guild_idx - 1].0.clone(),
+                        event_str,
+                    )
+                } else {
+                    match (
+                        friendly_char,
+                        friendly_family,
+                        enemy_char,
+                        enemy_family,
+                        enemy_guild,
+                        event,
+                    ) {
+                        (Some(fc), Some(ff), Some(ec), Some(ef), Some(eg), Some(ev)) => {
+                            (fc, ff, ec, ef, eg, ev)
+                        }
+                        _ => {
+                            eprintln!(
+                                "Calibration failed: provide all string flags or use --interactive"
+                            );
+                            return;
+                        }
+                    }
+                };
+
+            match calibrate_format(
+                &input,
+                &friendly_char,
+                &friendly_family,
+                &enemy_char,
+                &enemy_family,
+                &enemy_guild,
+                &event,
+            ) {
                 Ok(fmt) => {
-                    println!("Detected packet format:");
+                    println!("Calibrated packet format:");
                     println!("  Opcode: 0x{:04X}", fmt.opcode);
                     println!("  Packet length: {} bytes", fmt.packet_len);
-                    println!("  Enemy char offset: {}", fmt.enemy_char_offset);
-                    println!("  Enemy family offset: {}", fmt.enemy_family_offset);
                     println!("  Friendly char offset: {}", fmt.friendly_char_offset);
                     println!("  Friendly family offset: {}", fmt.friendly_family_offset);
+                    println!("  Enemy char offset: {}", fmt.enemy_char_offset);
+                    println!("  Enemy family offset: {}", fmt.enemy_family_offset);
+                    println!("  Enemy guild offset: {}", fmt.guild_string_offset);
                     println!("  Guild marker offset: {}", fmt.guild_marker_offset);
-                    println!("  Guild flag offset rel: {:+}", fmt.guild_flag_offset_from_marker);
-                    println!("  Guild string offset rel: {:+}", fmt.guild_string_offset_from_marker);
+                    println!(
+                        "  Guild flag offset rel: {:+}",
+                        fmt.guild_flag_offset_from_marker
+                    );
+                    println!(
+                        "  Guild string offset rel: {:+}",
+                        fmt.guild_string_offset_from_marker
+                    );
+                    println!("  Is death value: {}", fmt.is_death_value);
 
-                    match save_packet_format(&fmt) {
-                        Ok(()) => println!("\nSaved to {}", packet_format_path().display()),
-                        Err(e) => eprintln!("\nFailed to save: {}", e),
+                    // Append to known_formats.json in the current directory.
+                    let path = std::path::PathBuf::from("known_formats.json");
+                    let mut formats = if path.exists() {
+                        match std::fs::read_to_string(&path) {
+                            Ok(json) => serde_json::from_str::<Vec<_>>(&json)
+                                .unwrap_or_else(|_| load_known_formats()),
+                            Err(_) => load_known_formats(),
+                        }
+                    } else {
+                        load_known_formats()
+                    };
+                    formats.retain(|f| !(f.opcode == fmt.opcode && f.packet_len == fmt.packet_len));
+                    formats.push(fmt.clone());
+                    match serde_json::to_string_pretty(&formats) {
+                        Ok(json) => match std::fs::write(&path, json) {
+                            Ok(()) => println!("\nSaved to {}", path.display()),
+                            Err(e) => eprintln!("\nFailed to save: {}", e),
+                        },
+                        Err(e) => eprintln!("\nFailed to serialize format: {}", e),
                     }
                 }
-                Err(e) => eprintln!("Detection failed: {}", e),
+                Err(e) => eprintln!("Calibration failed: {}", e),
             }
         }
-        Commands::DumpStrings { input, opcode, packet_len } => {
+        Commands::DumpStrings {
+            input,
+            opcode,
+            packet_len,
+        } => {
             let fmt = load_packet_formats();
-            let target = opcode.zip(packet_len)
-                .or_else(|| fmt.first().map(|f| (f.opcode, f.packet_len)));
+            let target = opcode
+                .zip(packet_len)
+                .or_else(|| fmt.last().map(|f| (f.opcode, f.packet_len)));
 
             let (target_opcode, target_len) = match target {
                 Some((op, len)) => (op, len),
@@ -385,10 +620,14 @@ fn main() {
                     return;
                 }
             };
+            let mut dumped = 0;
 
             let mut cap = match pcap::Capture::from_file(&input) {
                 Ok(c) => c,
-                Err(e) => { eprintln!("Failed to open pcap: {}", e); return; }
+                Err(e) => {
+                    eprintln!("Failed to open pcap: {}", e);
+                    return;
+                }
             };
             let mut streams: HashMap<(IpAddr, u16, IpAddr, u16), TcpState> = HashMap::new();
 
@@ -397,20 +636,33 @@ fn main() {
                     if let Some(transport) = headers.transport {
                         if let etherparse::TransportHeader::Tcp(tcp) = transport {
                             let payload = headers.payload.slice();
-                            if payload.is_empty() { continue; }
+                            if payload.is_empty() {
+                                continue;
+                            }
 
                             let src_ip = match headers.net.as_ref().unwrap() {
-                                etherparse::NetHeaders::Ipv4(ipv4, _) => IpAddr::V4(Ipv4Addr::from(ipv4.source)),
-                                etherparse::NetHeaders::Ipv6(ipv6, _) => IpAddr::V6(std::net::Ipv6Addr::from(ipv6.source)),
+                                etherparse::NetHeaders::Ipv4(ipv4, _) => {
+                                    IpAddr::V4(Ipv4Addr::from(ipv4.source))
+                                }
+                                etherparse::NetHeaders::Ipv6(ipv6, _) => {
+                                    IpAddr::V6(std::net::Ipv6Addr::from(ipv6.source))
+                                }
                                 etherparse::NetHeaders::Arp(_) => continue,
                             };
                             let dst_ip = match headers.net.as_ref().unwrap() {
-                                etherparse::NetHeaders::Ipv4(ipv4, _) => IpAddr::V4(Ipv4Addr::from(ipv4.destination)),
-                                etherparse::NetHeaders::Ipv6(ipv6, _) => IpAddr::V6(std::net::Ipv6Addr::from(ipv6.destination)),
+                                etherparse::NetHeaders::Ipv4(ipv4, _) => {
+                                    IpAddr::V4(Ipv4Addr::from(ipv4.destination))
+                                }
+                                etherparse::NetHeaders::Ipv6(ipv6, _) => {
+                                    IpAddr::V6(std::net::Ipv6Addr::from(ipv6.destination))
+                                }
                                 etherparse::NetHeaders::Arp(_) => continue,
                             };
                             let key = (src_ip, tcp.source_port, dst_ip, tcp.destination_port);
-                            let state = streams.entry(key).or_insert(TcpState { buffer: Vec::new(), next_seq: tcp.sequence_number });
+                            let state = streams.entry(key).or_insert(TcpState {
+                                buffer: Vec::new(),
+                                next_seq: tcp.sequence_number,
+                            });
 
                             let seq = tcp.sequence_number;
                             let payload_len = payload.len() as u32;
@@ -425,17 +677,36 @@ fn main() {
 
                             let mut offset = 0;
                             while offset + 5 <= state.buffer.len() {
-                                let p_len = u16::from_le_bytes([state.buffer[offset], state.buffer[offset + 1]]) as usize;
-                                if p_len < 5 || p_len > 1000 { offset += 1; continue; }
-                                if offset + p_len > state.buffer.len() { break; }
+                                let p_len = u16::from_le_bytes([
+                                    state.buffer[offset],
+                                    state.buffer[offset + 1],
+                                ]) as usize;
+                                if p_len < 5 || p_len > 1000 {
+                                    offset += 1;
+                                    continue;
+                                }
+                                if offset + p_len > state.buffer.len() {
+                                    break;
+                                }
 
                                 let bdo_packet = &state.buffer[offset..offset + p_len];
                                 let is_unencrypted = bdo_packet[2] == 0x00;
                                 let opcode_val = u16::from_le_bytes([bdo_packet[3], bdo_packet[4]]);
 
-                                if is_unencrypted && opcode_val == target_opcode && p_len == target_len {
+                                if is_unencrypted
+                                    && opcode_val == target_opcode
+                                    && p_len == target_len
+                                {
                                     let strings = find_all_bdo_strings(bdo_packet);
-                                    let guild = find_guild_marker(bdo_packet);
+                                    let known_formats = load_known_formats();
+                                    let guild = find_guild_marker(
+                                        bdo_packet,
+                                        &strings,
+                                        opcode_val,
+                                        p_len,
+                                        &known_formats,
+                                    );
+                                    dumped += 1;
 
                                     println!("Found matching packet ({} bytes):\n", p_len);
                                     println!("--- All BDO strings by offset ---");
@@ -447,14 +718,32 @@ fn main() {
                                         let guild_off = gm_off + guild_rel as usize;
                                         println!("\n--- Guild marker ---");
                                         println!("  Marker at offset: {}", gm_off);
-                                        println!("  Flag rel: {:+} -> byte {}", flag_rel, if flag_rel >= 0 { gm_off + flag_rel as usize } else { gm_off.saturating_sub((-flag_rel) as usize) });
-                                        println!("  Guild string rel: {:+} -> byte {} -> \"{}\"", guild_rel, guild_off, read_bdo_string(bdo_packet, guild_off));
-                                        println!("\n--- Raw bytes around marker (offset {}) ---", gm_off);
+                                        println!(
+                                            "  Flag rel: {:+} -> byte {}",
+                                            flag_rel,
+                                            if flag_rel >= 0 {
+                                                gm_off + flag_rel as usize
+                                            } else {
+                                                gm_off.saturating_sub((-flag_rel) as usize)
+                                            }
+                                        );
+                                        println!(
+                                            "  Guild string rel: {:+} -> byte {} -> \"{}\"",
+                                            guild_rel,
+                                            guild_off,
+                                            read_bdo_string(bdo_packet, guild_off)
+                                        );
+                                        println!(
+                                            "\n--- Raw bytes around marker (offset {}) ---",
+                                            gm_off
+                                        );
                                         let start = gm_off.saturating_sub(8);
                                         let end = (gm_off + 20).min(bdo_packet.len());
                                         for i in start..end {
                                             print!("{:02x} ", bdo_packet[i]);
-                                            if (i - start + 1) % 16 == 0 { println!(); }
+                                            if (i - start + 1) % 16 == 0 {
+                                                println!();
+                                            }
                                         }
                                         println!();
                                     } else {
@@ -462,9 +751,16 @@ fn main() {
                                     }
 
                                     println!();
-                                    // Only dump the first 5 matching packets, then stats
+                                    // Stop after dumping the first 5 matching packets
+                                    if dumped >= 5 {
+                                        return;
+                                    }
                                 }
                                 offset += p_len;
+                            }
+
+                            if offset > 0 {
+                                state.buffer.drain(0..offset);
                             }
                         }
                     }

@@ -2657,6 +2657,7 @@ dependencies = [
  "etherparse",
  "pcap",
  "rodent_logger_core",
+ "serde_json",
 ]
 
 [[package]]

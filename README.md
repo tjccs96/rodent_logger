@@ -22,7 +22,7 @@ To run this project, you need the appropriate PCAP packet capture library instal
 ## Building from Source
 
 ```bash
-git clone https://github.com/your-username/rodent_logger.git
+git clone https://github.com/tjccs96/rodent_logger.git
 cd rodent_logger
 cargo build    # CLI only
 ```
@@ -58,6 +58,8 @@ rodent_logger capture <INTERFACE_NAME> -f "tcp portrange 8888-9993"
 
 When BDO patches change the packet layout, run `detect` to discover the current format. The result is saved to `packet_format.json` and used automatically by `export-csv`.
 
+`export-csv` also checks its input capture before decoding. If it finds the same PvP packet with moved string slots, or discovers a new opcode/packet size, it refreshes `packet_format.json` automatically. The detector requires the UTF-16 name fields plus the guild marker and its nearby boolean flag, so ordinary chat or system packets are not selected just because they contain text.
+
 ```bash
 rodent_logger detect -i my_nodewar.pcap
 ```
@@ -65,6 +67,15 @@ rodent_logger detect -i my_nodewar.pcap
 Optionally provide your own family name to help resolve friendly/enemy orientation:
 
 ```bash
+rodent_logger detect -i my_nodewar.pcap -n MyFamilyName
+```
+
+The flag's *location* can be detected automatically, but its meaning cannot be inferred from bytes alone: a new packet family may need one known kill/death event. In that case use `calibrate --interactive` once, then the mapping is retained while later automatic offset refreshes happen.
+
+`packet_format.json` is the active cache used by `export-csv`; it can be regenerated. `known_formats.json` is the reference library of verified layouts and kill/death flag meanings. Calibration updates `known_formats.json`; run `detect` afterwards to write the calibrated result to `packet_format.json`.
+
+```bash
+rodent_logger calibrate -i my_nodewar.pcap --interactive
 rodent_logger detect -i my_nodewar.pcap -n MyFamilyName
 ```
 
@@ -77,16 +88,16 @@ rodent_logger export-csv -i my_nodewar.pcap -o events.csv
 ```
 
 **CSV Format Output:**
-`Timestamp | Event (Kill/Death) | Enemy Guild | Friendly Player | Enemy Player`
+`Timestamp | Event (Kill/Death) | Friendly Family | Friendly Player | Enemy Guild | Enemy Player`
 
 **Example `events.csv`:**
 
 ```csv
-Timestamp,Event,Guild,Player 1,Player 2
-1720456789.123456,Kill,EnemyGuild,Smith (Guardian),Jones (Wizard)
-1720456790.234567,Death,EnemyGuild,Smith (Guardian),Jones (Wizard)
-1720456791.345678,Kill,AnotherGuild,Doe (Lahn),Brown (Warrior)
-1720456792.456789,Kill,EnemyGuild,Smith (Guardian),Davis (Ranger)
+Timestamp,Event,Friendly Family,Friendly Player,Enemy Guild,Enemy Player
+1720456789.123456,Kill,Smith,Guardian,EnemyGuild,Jones (Wizard)
+1720456790.234567,Death,Smith,Guardian,EnemyGuild,Jones (Wizard)
+1720456791.345678,Kill,Doe,Lahn,AnotherGuild,Brown (Warrior)
+1720456792.456789,Kill,Smith,Guardian,EnemyGuild,Davis (Ranger)
 ```
 
 ### 5. View K/D Statistics
@@ -178,18 +189,27 @@ rodent_logger detect -i my_nodewar.pcap -n MyFamilyName
 
 Then re-run `export-csv`.
 
-### Kills/Deaths look swapped or guilds are wrong
+### Kills/Deaths look swapped, or player/guild fields are wrong
 
-Delete `packet_format.json` and re-run `detect` with your character name to reorient friendly/enemy fields:
+Do not guess the kill/death flag value. Calibrate a single event whose outcome you know, then rebuild the active format with your family name:
 
 ```bash
-rm packet_format.json
+rodent_logger calibrate -i my_nodewar.pcap --interactive
 rodent_logger detect -i my_nodewar.pcap -n MyFamilyName
 ```
 
+You can delete `packet_format.json` if it is stale; it is only the active cache. Keep `known_formats.json`, because it contains the verified flag mapping.
+
 ### No events after a patch
 
-Use `find-opcode` with a known player name to discover the new opcode, then update or regenerate `packet_format.json` with `detect`.
+First try `export-csv`: it automatically discovers a new opcode and packet size. If that fails, use `find-opcode` with a known player name, inspect the candidate with `dump-strings`, and calibrate one known event:
+
+```bash
+rodent_logger find-opcode -i my_nodewar.pcap -n KnownPlayerName
+rodent_logger dump-strings -i my_nodewar.pcap -o 0x1234 -p 355
+rodent_logger calibrate -i my_nodewar.pcap --interactive
+rodent_logger detect -i my_nodewar.pcap -n MyFamilyName
+```
 
 ## License
 

@@ -1,5 +1,19 @@
 [
   {
+    "opcode": 7223,
+    "packet_len": 355,
+    "enemy_char_offset": 5,
+    "enemy_family_offset": 262,
+    "friendly_char_offset": 67,
+    "friendly_family_offset": 200,
+    "guild_marker_offset": 194,
+    "guild_flag_offset_from_marker": 5,
+    "guild_string_offset_from_marker": -62,
+    "guild_string_offset": 132,
+    "is_death_value": 0,
+    "old_format": false
+  },
+  {
     "opcode": 6834,
     "packet_len": 358,
     "enemy_char_offset": 8,
@@ -8,7 +22,9 @@
     "friendly_family_offset": 205,
     "guild_marker_offset": 196,
     "guild_flag_offset_from_marker": 4,
-    "guild_string_offset_from_marker": 9,
-    "guild_string_offset": 133
+    "guild_string_offset_from_marker": -63,
+    "guild_string_offset": 133,
+    "is_death_value": 0,
+    "old_format": false
   }
 ]

@@ -37,7 +37,7 @@ pub fn rodent_logger_dir(subdir: &str) -> std::path::PathBuf {
     dir
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PacketFormat {
     pub opcode: u16,
     pub packet_len: usize,
@@ -50,6 +50,10 @@ pub struct PacketFormat {
     pub guild_string_offset_from_marker: isize,
     #[serde(default)]
     pub guild_string_offset: usize,
+    #[serde(default)]
+    pub is_death_value: u8,
+    #[serde(default)]
+    pub old_format: bool,
 }
 
 pub struct TcpState {
@@ -93,14 +97,14 @@ pub fn find_all_bdo_strings(payload: &[u8]) -> Vec<(String, usize)> {
     let mut results: Vec<(String, usize)> = Vec::new();
     let mut i = 0;
     while i + 2 <= payload.len() {
-        if payload[i] >= 0x20 && payload[i] <= 0x7E && payload[i + 1] == 0x00 {
+        let end_limit = (i + 62).min(payload.len());
+        let has_terminator = payload[i..end_limit]
+            .chunks_exact(2)
+            .any(|pair| pair == [0x00, 0x00]);
+        if payload[i] >= 0x20 && payload[i] <= 0x7E && payload[i + 1] == 0x00 && has_terminator {
             let s = read_bdo_string(payload, i);
-            let len = s.len();
-            if len >= 3
-                && len <= 30
-                && s.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c.is_ascii_punctuation())
-            {
+            let len = s.encode_utf16().count();
+            if len >= 3 && len <= 30 && s.chars().all(|c| !c.is_control() && c != '\u{fffd}') {
                 results.push((s, i));
                 i += len * 2;
                 continue;
@@ -111,41 +115,85 @@ pub fn find_all_bdo_strings(payload: &[u8]) -> Vec<(String, usize)> {
     results
 }
 
-pub fn find_guild_marker(payload: &[u8]) -> Option<(usize, isize, isize)> {
+fn uppercase_ratio(s: &str) -> f32 {
+    let letters: Vec<char> = s.chars().filter(|c| c.is_alphabetic()).collect();
+    if letters.is_empty() {
+        return 0.0;
+    }
+    let uppercase = letters.iter().filter(|c| c.is_uppercase()).count();
+    uppercase as f32 / letters.len() as f32
+}
+
+pub fn find_guild_marker(
+    payload: &[u8],
+    strings: &[(String, usize)],
+    opcode: u16,
+    packet_len: usize,
+    known_formats: &[PacketFormat],
+) -> Option<(usize, isize, usize)> {
     for i in 0..payload.len().saturating_sub(7) {
         if payload[i] == 0x06
             && payload[i + 1] == 0x00
             && payload[i + 2] == 0x00
             && payload[i + 3] == 0x00
         {
-            // Scan forward from marker to find the next valid BDO string (guild name)
-            let marker_end = i + 4;
-            let search_end = (marker_end + 20).min(payload.len());
-            for guild_off in marker_end..search_end {
-                if payload[guild_off] >= 0x20
-                    && payload[guild_off] <= 0x7E
-                    && guild_off + 1 < payload.len()
-                    && payload[guild_off + 1] == 0x00
-                {
-                    let guild = read_bdo_string(payload, guild_off);
-                    if guild.len() >= 3
-                        && guild
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || c.is_ascii_punctuation())
-                    {
-                        let (flag_rel, guild_rel) = if i % 2 == 1 {
-                            (-1, guild_off as isize - i as isize)
-                        } else {
-                            if i >= 1 && payload[i - 1] <= 1 {
-                                (-1, guild_off as isize - i as isize)
-                            } else {
-                                (4, guild_off as isize - i as isize)
-                            }
-                        };
-                        return Some((i, flag_rel, guild_rel));
-                    }
+            let before = strings.iter().rev().find(|(_, off)| *off < i);
+            let after = strings.iter().find(|(_, off)| *off > i);
+
+            let known = known_formats
+                .iter()
+                .find(|f| f.opcode == opcode && f.packet_len == packet_len);
+
+            let guild_off = if let Some(k) = known {
+                if k.guild_string_offset_from_marker < 0 {
+                    before
+                        .map(|(_, off)| *off)
+                        .or_else(|| after.map(|(_, off)| *off))?
+                } else {
+                    after
+                        .map(|(_, off)| *off)
+                        .or_else(|| before.map(|(_, off)| *off))?
                 }
-            }
+            } else {
+                match (before, after) {
+                    (Some((b, b_off)), Some((a, a_off))) => {
+                        let b_ratio = uppercase_ratio(b);
+                        let a_ratio = uppercase_ratio(a);
+                        if b_ratio > a_ratio {
+                            *b_off
+                        } else if a_ratio > b_ratio {
+                            *a_off
+                        } else {
+                            if i - b_off <= a_off - i {
+                                *b_off
+                            } else {
+                                *a_off
+                            }
+                        }
+                    }
+                    (Some((_, b_off)), None) => *b_off,
+                    (None, Some((_, a_off))) => *a_off,
+                    (None, None) => continue,
+                }
+            };
+
+            // The kill/death flag is a single byte with value 0x00 or 0x01.
+            // In older packets it sits right after the marker (+4); in newer
+            // packets it sits five bytes after the marker (+5).
+            let flag_rel = if let Some(k) = known {
+                k.guild_flag_offset_from_marker
+            } else {
+                let after4 = payload.get(i + 4).copied().unwrap_or(0xFF);
+                let after5 = payload.get(i + 5).copied().unwrap_or(0xFF);
+                if after4 <= 1 {
+                    4
+                } else if after5 <= 1 {
+                    5
+                } else {
+                    -1
+                }
+            };
+            return Some((i, flag_rel, guild_off));
         }
     }
     None
@@ -263,8 +311,200 @@ where
     Ok(())
 }
 
-/// Attempting to auto detect the packet format in case PA shifts string order around/packet size or
-/// where the byte for the kill  flag is
+/// Convert a Rust string to UTF-16LE bytes including the null terminator.
+fn utf16le_bytes_with_null(s: &str) -> Vec<u8> {
+    let utf16: Vec<u16> = s.encode_utf16().collect();
+    let mut bytes = Vec::with_capacity(utf16.len() * 2 + 2);
+    for &c in &utf16 {
+        bytes.extend_from_slice(&c.to_le_bytes());
+    }
+    bytes.extend_from_slice(&[0x00, 0x00]);
+    bytes
+}
+
+/// Find the most common event packet in a pcap and return all readable BDO
+/// strings with their byte offsets. This is used by the interactive calibrate
+/// mode so the user can pick which string is the friendly char, family, etc.
+pub fn find_calibration_candidates(
+    input: &str,
+) -> Result<(u16, usize, String, Vec<(String, usize)>), String> {
+    #[derive(Default)]
+    struct Candidate {
+        count: u32,
+        representative: Option<(Vec<u8>, String)>,
+    }
+
+    let mut candidates: HashMap<(u16, usize), Candidate> = HashMap::new();
+
+    build_streams_from_pcap(
+        input,
+        |is_unencrypted, opcode, packet_len, bdo_packet, ts| {
+            if !is_unencrypted || opcode == 0 || packet_len < 300 || packet_len > 500 {
+                return;
+            }
+            let strings = find_all_bdo_strings(bdo_packet);
+            if strings.len() < 5 {
+                return;
+            }
+
+            let entry = candidates.entry((opcode, packet_len)).or_default();
+            entry.count += 1;
+            if entry.representative.is_none() {
+                entry.representative = Some((bdo_packet.to_vec(), ts.to_string()));
+            }
+        },
+    )?;
+
+    let best = candidates
+        .into_iter()
+        .max_by_key(|(_, c)| c.count)
+        .ok_or_else(|| "No event packets found in pcap".to_string())?;
+
+    let (opcode, packet_len) = best.0;
+    let (packet, ts) = best
+        .1
+        .representative
+        .ok_or_else(|| "No representative packet".to_string())?;
+
+    let mut strings = find_all_bdo_strings(&packet);
+    strings.sort_by_key(|(_, off)| *off);
+
+    Ok((opcode, packet_len, ts, strings))
+}
+
+/// Calibrate a new packet format from a pcap containing a known event.
+///
+/// The user provides the friendly/enemy character/family names that
+/// appear in a single packet, plus whether that packet represents a kill or
+/// death. The function locates the packet, derives all string offsets, finds
+/// the guild marker, determines the kill/death flag, and returns a
+/// `PacketFormat` ready to be saved to `known_formats.json`.
+///
+/// Note: this requires all five strings to be present in the packet.
+pub fn calibrate_format(
+    input: &str,
+    friendly_char: &str,
+    friendly_family: &str,
+    enemy_char: &str,
+    enemy_family: &str,
+    enemy_guild: &str,
+    event: &str,
+) -> Result<PacketFormat, String> {
+    let event_lower = event.to_lowercase();
+    if event_lower != "kill" && event_lower != "death" {
+        return Err("event must be 'kill' or 'death'".to_string());
+    }
+
+    let friendly_char_bytes = utf16le_bytes_with_null(friendly_char);
+    let friendly_family_bytes = utf16le_bytes_with_null(friendly_family);
+    let enemy_char_bytes = utf16le_bytes_with_null(enemy_char);
+    let enemy_family_bytes = utf16le_bytes_with_null(enemy_family);
+    let enemy_guild_bytes = utf16le_bytes_with_null(enemy_guild);
+
+    let mut found_packet: Option<(u16, usize, Vec<u8>)> = None;
+
+    build_streams_from_pcap(
+        input,
+        |is_unencrypted, opcode, packet_len, bdo_packet, _ts| {
+            if found_packet.is_some()
+                || !is_unencrypted
+                || opcode == 0
+                || packet_len < 300
+                || packet_len > 500
+            {
+                return;
+            }
+
+            let has_all = bdo_packet
+                .windows(friendly_char_bytes.len())
+                .any(|w| w == friendly_char_bytes)
+                && bdo_packet
+                    .windows(friendly_family_bytes.len())
+                    .any(|w| w == friendly_family_bytes)
+                && bdo_packet
+                    .windows(enemy_char_bytes.len())
+                    .any(|w| w == enemy_char_bytes)
+                && bdo_packet
+                    .windows(enemy_family_bytes.len())
+                    .any(|w| w == enemy_family_bytes)
+                && bdo_packet
+                    .windows(enemy_guild_bytes.len())
+                    .any(|w| w == enemy_guild_bytes);
+
+            if has_all {
+                found_packet = Some((opcode, packet_len, bdo_packet.to_vec()));
+            }
+        },
+    )?;
+
+    let (opcode, packet_len, packet) = found_packet
+        .ok_or_else(|| "No packet containing all provided names was found".to_string())?;
+
+    fn find_offset(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    let friendly_char_offset = find_offset(&packet, &friendly_char_bytes)
+        .ok_or_else(|| format!("friendly char '{}' not found in packet", friendly_char))?;
+    let friendly_family_offset = find_offset(&packet, &friendly_family_bytes)
+        .ok_or_else(|| format!("friendly family '{}' not found in packet", friendly_family))?;
+    let enemy_char_offset = find_offset(&packet, &enemy_char_bytes)
+        .ok_or_else(|| format!("enemy char '{}' not found in packet", enemy_char))?;
+    let enemy_family_offset = find_offset(&packet, &enemy_family_bytes)
+        .ok_or_else(|| format!("enemy family '{}' not found in packet", enemy_family))?;
+    let enemy_guild_offset = find_offset(&packet, &enemy_guild_bytes)
+        .ok_or_else(|| format!("enemy guild '{}' not found in packet", enemy_guild))?;
+
+    // Find the guild marker.
+    let mut marker_offset = 0;
+    let mut flag_rel: isize = -1;
+    for i in 0..packet.len().saturating_sub(7) {
+        if packet[i] == 0x06
+            && packet[i + 1] == 0x00
+            && packet[i + 2] == 0x00
+            && packet[i + 3] == 0x00
+        {
+            marker_offset = i;
+            // Prefer +5 (newer format), fall back to +4 (older format).
+            if packet.get(i + 5).copied().unwrap_or(0xFF) <= 1 {
+                flag_rel = 5;
+            } else if packet.get(i + 4).copied().unwrap_or(0xFF) <= 1 {
+                flag_rel = 4;
+            }
+            break;
+        }
+    }
+
+    if marker_offset == 0 {
+        return Err("Guild marker (0x06 00 00 00) not found in packet".to_string());
+    }
+    if flag_rel < 0 {
+        return Err("Could not determine kill/death flag offset from marker".to_string());
+    }
+
+    let flag_value = packet[marker_offset + flag_rel as usize];
+    let is_death_value = if event_lower == "death" {
+        flag_value
+    } else {
+        1 - flag_value
+    };
+
+    Ok(PacketFormat {
+        opcode,
+        packet_len,
+        enemy_char_offset,
+        enemy_family_offset,
+        friendly_char_offset,
+        friendly_family_offset,
+        guild_marker_offset: marker_offset,
+        guild_flag_offset_from_marker: flag_rel,
+        guild_string_offset_from_marker: enemy_guild_offset as isize - marker_offset as isize,
+        guild_string_offset: enemy_guild_offset,
+        is_death_value,
+        old_format: false,
+    })
+}
+
 pub fn detect_format(input: &str, player_name: Option<&str>) -> Result<PacketFormat, String> {
     let target_bytes = player_name.map(|name| {
         let utf16: Vec<u16> = name.encode_utf16().collect();
@@ -282,6 +522,10 @@ pub fn detect_format(input: &str, player_name: Option<&str>) -> Result<PacketFor
     }
 
     let mut candidates: HashMap<(u16, usize), Candidate> = HashMap::new();
+    let known_formats = load_known_formats();
+    // Packets containing the player name, keyed by (opcode, packet_len), so
+    // orientation uses the same format as the detected one.
+    let mut name_representatives: HashMap<(u16, usize), Vec<u8>> = HashMap::new();
 
     build_streams_from_pcap(
         input,
@@ -290,21 +534,29 @@ pub fn detect_format(input: &str, player_name: Option<&str>) -> Result<PacketFor
                 return;
             }
 
-            if let Some(ref target) = target_bytes {
-                if !bdo_packet.windows(target.len()).any(|w| w == target) {
-                    return;
-                }
-            } else {
-                let strings = find_all_bdo_strings(bdo_packet);
-                if strings.len() < 4 {
-                    return;
-                }
+            let strings = find_all_bdo_strings(bdo_packet);
+            if strings.len() < 4 {
+                return;
+            }
+
+            if !find_guild_marker(bdo_packet, &strings, opcode, packet_len, &known_formats)
+                .is_some_and(|(_, flag_rel, _)| flag_rel >= 0)
+            {
+                return;
             }
 
             let entry = candidates.entry((opcode, packet_len)).or_default();
             entry.count += 1;
             if entry.representative.is_none() {
                 entry.representative = Some(bdo_packet.to_vec());
+            }
+
+            if let Some(ref target) = target_bytes {
+                if !name_representatives.contains_key(&(opcode, packet_len))
+                    && bdo_packet.windows(target.len()).any(|w| w == target)
+                {
+                    name_representatives.insert((opcode, packet_len), bdo_packet.to_vec());
+                }
             }
         },
     )?;
@@ -320,7 +572,35 @@ pub fn detect_format(input: &str, player_name: Option<&str>) -> Result<PacketFor
         .representative
         .ok_or_else(|| "No representative packet".to_string())?;
 
-    let strings = find_all_bdo_strings(&packet);
+    // For orientation, use a packet of the same (opcode, packet_len) that
+    // actually contains the player name.
+    let orient_packet = if player_name.is_some() {
+        name_representatives
+            .get(&(opcode, packet_len))
+            .ok_or_else(|| "Player name not found in any event packet".to_string())?
+    } else {
+        &packet
+    };
+
+    let mut strings = find_all_bdo_strings(&packet);
+    strings.sort_by_key(|(_, off)| *off);
+
+    // Find the guild marker and the guild string it points to.
+    let (marker_offset, flag_rel, guild_string_offset) =
+        find_guild_marker(&packet, &strings, opcode, packet_len, &known_formats)
+            .unwrap_or((0, 0, 0));
+
+    if let Some(known) = known_formats
+        .iter()
+        .find(|f| f.opcode == opcode && f.packet_len == packet_len && f.old_format)
+    {
+        let mut fmt = known.clone();
+        fmt.guild_marker_offset = marker_offset;
+        fmt.guild_flag_offset_from_marker = flag_rel;
+        fmt.guild_string_offset_from_marker = guild_string_offset as isize - marker_offset as isize;
+        return Ok(fmt);
+    }
+
     if strings.len() < 5 {
         return Err(format!(
             "Representative packet has fewer than 5 strings (found {})",
@@ -328,125 +608,64 @@ pub fn detect_format(input: &str, player_name: Option<&str>) -> Result<PacketFor
         ));
     }
 
-    let mut sorted = strings.clone();
-    sorted.sort_by_key(|(_, off)| *off);
+    let known_new = known_formats
+        .iter()
+        .find(|f| f.opcode == opcode && f.packet_len == packet_len && !f.old_format);
 
-    let (marker_offset, mut flag_rel, guild_rel) = find_guild_marker(&packet).unwrap_or((0, 0, 0));
+    let guild_idx = if marker_offset > 0 {
+        strings
+            .iter()
+            .enumerate()
+            .position(|(_, (_, off))| *off == guild_string_offset)
+            .unwrap_or(3)
+    } else {
+        3
+    };
 
-    // Override flag_rel: +4 is the standard position (right after 06 00 00 00).
-    if marker_offset > 0 && marker_offset + 4 < packet.len() {
-        flag_rel = 4;
+    // Build the ordered list of strings with the guild removed.
+    // Expected layout: [enemy_char, friendly_char, friendly_family, enemy_guild, enemy_family]
+    let mut ordered: Vec<(String, usize)> = Vec::new();
+    for (idx, item) in strings.iter().enumerate() {
+        if idx == guild_idx {
+            continue;
+        }
+        ordered.push(item.clone());
     }
 
-    let marker_target = if marker_offset > 0 {
-        marker_offset + guild_rel as usize
-    } else {
-        0
-    };
-
-    // Detect format version by checking what the marker points to:
-    // Format A (marker->sorted[2]): [enemy_char, friendly_char, guild, friendly_family, enemy_family]
-    // Format B (marker->sorted[1]): [enemy_char, guild, friendly_char, friendly_family, enemy_family]
-    // Format C (default):          [enemy_family, friendly_family, guild, friendly_char, enemy_char]
-    let format = if marker_target > 0 && marker_target == sorted[2].1 {
-        'A'
-    } else if marker_target > 0 && marker_target == sorted[1].1 {
-        'B'
-    } else {
-        'C'
-    };
-
-    let guild_offset = match format {
-        'A' => sorted[2].1,
-        'B' => sorted[1].1,
-        _ => sorted[2].1,
-    };
-
-    let friendly_char_idx = match format {
-        'A' => 1,
-        'B' => 2,
-        _ => 1,
-    };
-
-    let (
-        mut friendly_char_offset,
-        mut friendly_family_offset,
-        mut enemy_char_offset,
-        mut enemy_family_offset,
-    ) = match format {
-        'A' => {
-            // Format A: s0=enemy_char, s1=friendly_char, s2=guild, s3=friendly_family, s4=enemy_family
-            (sorted[1].1, sorted[3].1, sorted[0].1, sorted[4].1)
-        }
-        'B' => {
-            // Format B: s0=enemy_char, s1=guild, s2=friendly_char, s3=friendly_family, s4=enemy_family
-            (sorted[2].1, sorted[3].1, sorted[0].1, sorted[4].1)
-        }
-        _ => {
-            // Format C: s0=enemy_char, s1=friendly_char, s2=guild, s3=friendly_family, s4=enemy_family
-            (sorted[1].1, sorted[3].1, sorted[0].1, sorted[4].1)
-        }
-    };
-
-    if format == 'C' && player_name.is_none() {
-        let mut s0_overlap: u32 = 0;
-        let mut s4_overlap: u32 = 0;
-        let mut total: u32 = 0;
-
-        let _ = build_streams_from_pcap(input, |is_unencrypted, op, pl, bdo_packet, _ts| {
-            if !is_unencrypted || op != opcode || pl != packet_len {
-                return;
-            }
-            let strs = find_all_bdo_strings(bdo_packet);
-            if strs.len() < 5 {
-                return;
-            }
-            let mut s = strs.clone();
-            s.sort_by_key(|(_, off)| *off);
-
-            let fc = &s[friendly_char_idx].0;
-            if &s[0].0 == fc {
-                s0_overlap += 1;
-            }
-            if &s[4].0 == fc {
-                s4_overlap += 1;
-            }
-            total += 1;
-        });
-
-        if total > 5 && s4_overlap > s0_overlap && s4_overlap > total / 10 {
-            enemy_char_offset = sorted[4].1;
-            enemy_family_offset = sorted[0].1;
-        }
+    if ordered.len() < 4 {
+        return Err(format!(
+            "Could not identify four character/family strings (found {})",
+            ordered.len()
+        ));
     }
 
-    // If --name given, match it against friendly_char or enemy_char
+    let mut enemy_char_offset = ordered[0].1;
+    let mut friendly_char_offset = ordered[1].1;
+    let mut friendly_family_offset = ordered[2].1;
+    let mut enemy_family_offset = ordered[3].1;
+    let guild_string_offset = strings[guild_idx].1;
+
+    // If --name given, orient the friendly/enemy pairs using a packet that
+    // actually contains the name. The format itself is derived from the most
+    // common packet, so the offsets are the same.
     if let Some(ref name) = player_name {
         let utf16: Vec<u16> = name.encode_utf16().collect();
         let mut name_bytes = Vec::with_capacity(utf16.len() * 2);
         for &c in &utf16 {
             name_bytes.extend_from_slice(&c.to_le_bytes());
         }
-        let pos = packet
+        let pos = orient_packet
             .windows(name_bytes.len())
             .position(|w| w == name_bytes)
             .ok_or_else(|| format!("Player name '{}' not found in packet", name))?;
 
-        if pos == friendly_char_offset {
-            // Name matches friendly — keep default
-        } else if pos == enemy_char_offset {
-            // Name matches enemy — swap
+        if pos == enemy_char_offset {
             std::mem::swap(&mut friendly_char_offset, &mut enemy_char_offset);
             std::mem::swap(&mut friendly_family_offset, &mut enemy_family_offset);
-        } else {
-            let expected = match format {
-                'A' => format!("{} or {}", sorted[0].1, sorted[1].1),
-                'B' => format!("{} or {}", sorted[0].1, sorted[2].1),
-                _ => format!("{} or {}", sorted[1].1, sorted[4].1),
-            };
+        } else if pos != friendly_char_offset {
             return Err(format!(
-                "Name '{}' not at a character offset (expected {})",
-                name, expected
+                "Name '{}' not at a character offset (expected {} or {})",
+                name, friendly_char_offset, enemy_char_offset
             ));
         }
     }
@@ -460,13 +679,56 @@ pub fn detect_format(input: &str, player_name: Option<&str>) -> Result<PacketFor
         friendly_family_offset,
         guild_marker_offset: marker_offset,
         guild_flag_offset_from_marker: flag_rel,
-        guild_string_offset_from_marker: guild_rel,
-        guild_string_offset: guild_offset,
+        guild_string_offset_from_marker: guild_string_offset as isize - marker_offset as isize,
+        guild_string_offset: guild_string_offset,
+        is_death_value: known_new.map(|k| k.is_death_value).unwrap_or(0),
+        old_format: false,
     })
 }
 
 pub fn packet_format_path() -> std::path::PathBuf {
     std::path::PathBuf::from("packet_format.json")
+}
+
+/// Load known packet formats from an external `known_formats.json` file, falling
+/// back to the embedded defaults shipped with the binary.
+///
+/// Searches, in order:
+/// 1. The current working directory.
+/// 2. The executable's directory.
+/// 3. The embedded default (`rodent_logger_core/src/known_formats.json`).
+pub fn load_known_formats() -> Vec<PacketFormat> {
+    let candidates = [
+        std::path::PathBuf::from("known_formats.json"),
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .map(|p| p.join("known_formats.json"))
+            .unwrap_or_default(),
+    ];
+
+    for path in &candidates {
+        if path.exists() {
+            match std::fs::read_to_string(path) {
+                Ok(json) => match serde_json::from_str::<Vec<PacketFormat>>(&json) {
+                    Ok(formats) => return formats,
+                    Err(e) => eprintln!(
+                        "Warning: failed to parse known_formats.json at {}: {}. Using embedded defaults.",
+                        path.display(),
+                        e
+                    ),
+                },
+                Err(e) => eprintln!(
+                    "Warning: failed to read known_formats.json at {}: {}. Using embedded defaults.",
+                    path.display(),
+                    e
+                ),
+            }
+        }
+    }
+
+    const DEFAULT_JSON: &str = include_str!("known_formats.json");
+    serde_json::from_str(DEFAULT_JSON).unwrap_or_default()
 }
 
 pub fn load_packet_formats() -> Vec<PacketFormat> {
@@ -511,6 +773,69 @@ pub fn save_packet_format(fmt: &PacketFormat) -> Result<(), String> {
 
 pub fn load_packet_format() -> Option<PacketFormat> {
     load_packet_formats().into_iter().last()
+}
+
+/// Returns whether two formats describe the same packet layout.  The event
+/// value is deliberately excluded: its meaning (which byte value is a death)
+/// cannot be inferred from bytes alone and is preserved from a calibrated
+/// format when a patch only moves fields around.
+fn same_packet_layout(left: &PacketFormat, right: &PacketFormat) -> bool {
+    left.opcode == right.opcode
+        && left.packet_len == right.packet_len
+        && left.enemy_char_offset == right.enemy_char_offset
+        && left.enemy_family_offset == right.enemy_family_offset
+        && left.friendly_char_offset == right.friendly_char_offset
+        && left.friendly_family_offset == right.friendly_family_offset
+        && left.guild_marker_offset == right.guild_marker_offset
+        && left.guild_flag_offset_from_marker == right.guild_flag_offset_from_marker
+        && left.guild_string_offset_from_marker == right.guild_string_offset_from_marker
+        && left.guild_string_offset == right.guild_string_offset
+        && left.old_format == right.old_format
+}
+
+/// Detect a layout in the current capture before export. This makes an
+/// existing `packet_format.json` self-healing when a game patch changes an
+/// opcode, packet size, or fixed string slot. The kill/death byte mapping is
+/// retained for an updated layout because packet contents alone do not reveal
+/// which semantic label belongs to `0` or `1`.
+fn refresh_packet_formats(input: &str, formats: &mut Vec<PacketFormat>) -> Result<(), String> {
+    let mut detected = match detect_format(input, None) {
+        Ok(format) => format,
+        Err(error) if formats.is_empty() => return Err(error),
+        Err(_) => return Ok(()), // A capture without PvP events can still use saved formats.
+    };
+
+    if let Some(existing) = formats
+        .iter()
+        .find(|format| format.opcode == detected.opcode && format.packet_len == detected.packet_len)
+    {
+        // Keep the known event meaning and old-format behavior while replacing
+        // only a layout that the current capture proves has moved.
+        detected.is_death_value = existing.is_death_value;
+        detected.old_format = existing.old_format;
+        if same_packet_layout(existing, &detected) {
+            return Ok(());
+        }
+
+        eprintln!(
+            "Detected an updated layout for opcode 0x{:04X} ({} bytes); refreshing saved offsets.",
+            detected.opcode, detected.packet_len
+        );
+    } else {
+        eprintln!(
+            "Detected a new event format: opcode 0x{:04X}, {} bytes. Saving it for future exports.",
+            detected.opcode, detected.packet_len
+        );
+    }
+
+    if let Some(position) = formats.iter().position(|format| {
+        format.opcode == detected.opcode && format.packet_len == detected.packet_len
+    }) {
+        formats[position] = detected.clone();
+    } else {
+        formats.push(detected.clone());
+    }
+    save_all_packet_formats(formats)
 }
 
 pub fn capture(
@@ -580,16 +905,12 @@ pub fn capture(
 
 pub fn export_csv(input: &str, output: &str) -> Result<u64, String> {
     let mut formats = load_packet_formats();
-    if formats.is_empty() {
-        if let Ok(fmt) = detect_format(input, None) {
-            let _ = save_packet_format(&fmt);
-            formats = vec![fmt];
-        } else {
-            return Err(
-                "Could not detect packet format from pcap and no saved config found".to_string(),
-            );
-        }
-    }
+    refresh_packet_formats(input, &mut formats).map_err(|error| {
+        format!(
+            "Could not detect packet format from pcap and no saved config found: {}",
+            error
+        )
+    })?;
 
     let format_map: HashMap<(u16, usize), &PacketFormat> = formats
         .iter()
@@ -600,8 +921,15 @@ pub fn export_csv(input: &str, output: &str) -> Result<u64, String> {
         pcap::Capture::from_file(input).map_err(|e| format!("Failed to open pcap: {}", e))?;
     let mut wtr = Writer::from_path(output).map_err(|e| format!("Failed to create CSV: {}", e))?;
 
-    wtr.write_record(&["Timestamp", "Event", "Guild", "Player 1", "Player 2"])
-        .map_err(|e| format!("Failed to write CSV headers: {}", e))?;
+    wtr.write_record(&[
+        "Timestamp",
+        "Event",
+        "Friendly Family",
+        "Friendly Player",
+        "Enemy Guild",
+        "Enemy Player",
+    ])
+    .map_err(|e| format!("Failed to write CSV headers: {}", e))?;
 
     let mut count = 0;
     let mut streams: HashMap<(IpAddr, u16, IpAddr, u16), TcpState> = HashMap::new();
@@ -736,7 +1064,8 @@ pub fn export_csv(input: &str, output: &str) -> Result<u64, String> {
                                                 i.saturating_sub((-flag_rel) as usize)
                                             };
                                             if flag_idx < bdo_packet.len() {
-                                                is_death = bdo_packet[flag_idx] == 0x00;
+                                                is_death =
+                                                    bdo_packet[flag_idx] == fmt.is_death_value;
                                             }
 
                                             // Fallback: if no direct guild offset, use marker-based guild
@@ -757,15 +1086,18 @@ pub fn export_csv(input: &str, output: &str) -> Result<u64, String> {
                                     }
 
                                     let event_str = if is_death { "Death" } else { "Kill" };
-                                    let friendly_name =
-                                        format!("{} ({})", friendly_family, friendly_char);
-                                    let enemy_name = format!("{} ({})", enemy_family, enemy_char);
+                                    let enemy_name = if fmt.old_format {
+                                        enemy_family.clone()
+                                    } else {
+                                        format!("{} ({})", enemy_family, enemy_char)
+                                    };
 
                                     wtr.write_record(&[
                                         &ts,
                                         event_str,
+                                        &friendly_family,
+                                        &friendly_char,
                                         &enemy_guild,
-                                        &friendly_name,
                                         &enemy_name,
                                     ])
                                     .map_err(|e| format!("Failed to write CSV record: {}", e))?;
@@ -812,10 +1144,26 @@ pub fn generate_stats(input: &str) -> String {
             continue;
         }
 
-        let event = &record[1];
-        let guild = &record[2];
-        let player_1 = &record[3];
-        let player_2 = &record[4];
+        let (event, enemy_guild, player_1, player_2) = if record.len() == 5 {
+            // Old: Timestamp, Event, Guild, Player 1, Player 2
+            (
+                record[1].to_string(),
+                record[2].to_string(),
+                record[3].to_string(),
+                record[4].to_string(),
+            )
+        } else if record.len() >= 6 {
+            // New: Timestamp, Event, Friendly Family, Friendly Player, Enemy Guild, Enemy Player
+            (
+                record[1].to_string(),
+                record[4].to_string(),
+                format!("{} ({})", record[2].trim(), record[3].trim()),
+                record[5].to_string(),
+            )
+        } else {
+            continue;
+        };
+
         let is_death = event.to_lowercase() == "death";
 
         let p_stats = stats_map.entry(player_1.to_string()).or_default();
@@ -825,10 +1173,10 @@ pub fn generate_stats(input: &str) -> String {
             p_stats.kills += 1;
         }
 
-        let guild_key = if guild.trim().is_empty() {
+        let guild_key = if enemy_guild.trim().is_empty() {
             "No Guild".to_string()
         } else {
-            guild.to_string()
+            enemy_guild.to_string()
         };
 
         let guild_players = enemy_per_guild.entry(guild_key.clone()).or_default();
@@ -856,7 +1204,7 @@ pub fn generate_stats(input: &str) -> String {
     ));
     out.push_str(&format!(
         "{:<35} | {:<6} | {:<6} | {:<5}\n",
-        "Family (Character)", "Kills", "Deaths", "K/D"
+        "Friendly Player", "Kills", "Deaths", "K/D"
     ));
     out.push_str("----------------------------------------------------\n");
 
@@ -903,7 +1251,7 @@ pub fn generate_stats(input: &str) -> String {
         ));
         out.push_str(&format!(
             "  {:<35} | {:<6} | {:<6} | {:<5}\n",
-            "Family (Character)", "Kills", "Deaths", "K/D"
+            "Enemy Player", "Kills", "Deaths", "K/D"
         ));
 
         for (player, stats) in &player_vec {
@@ -980,4 +1328,24 @@ pub fn generate_stats(input: &str) -> String {
     out.push_str("====================================================\n");
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_all_bdo_strings;
+
+    #[test]
+    fn finds_utf16_names_with_spaces_and_unicode() {
+        let mut payload = vec![0xAA, 0xBB, 0xCC];
+        let expected = "Guild Árvore";
+        for code_unit in expected.encode_utf16() {
+            payload.extend_from_slice(&code_unit.to_le_bytes());
+        }
+        payload.extend_from_slice(&[0, 0]);
+
+        assert_eq!(
+            find_all_bdo_strings(&payload),
+            vec![(expected.to_string(), 3)]
+        );
+    }
 }
